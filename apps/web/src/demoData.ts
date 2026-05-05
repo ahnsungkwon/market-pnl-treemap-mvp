@@ -1,18 +1,14 @@
-import cors from 'cors'
-import express from 'express'
-import morgan from 'morgan'
-import { createServer } from 'node:http'
-import { WebSocketServer } from 'ws'
+import type { MarketRow, SnapshotMessage, TreemapNode } from './types'
 
-const PORT = Number(process.env.PORT ?? 3001)
-const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:5173'
+type SeedMarketRow = Omit<MarketRow, 'change_pct'>
 
-const app = express()
-app.use(cors({ origin: CORS_ORIGIN }))
-app.use(express.json())
-app.use(morgan('dev'))
+type Position = {
+  symbol: string
+  qty: number
+  avg_price: number
+}
 
-const seedMarket = [
+const seedMarket: SeedMarketRow[] = [
   {
     symbol: '005930.KS',
     name: 'Samsung Electronics',
@@ -69,7 +65,7 @@ const seedMarket = [
   }
 ]
 
-const positions = [
+const positions: Position[] = [
   { symbol: '005930.KS', qty: 100, avg_price: 65000 },
   { symbol: '000660.KS', qty: 12, avg_price: 122000 },
   { symbol: '035420.KS', qty: 8, avg_price: 181000 },
@@ -78,28 +74,27 @@ const positions = [
 ]
 
 let market = seedMarket.map((row) => ({ ...row }))
-const ticks = []
 
-function roundPrice(value) {
+function roundPrice(value: number) {
   return Math.max(1, Math.round(value / 100) * 100)
 }
 
-function changePct(row) {
+function changePct(row: SeedMarketRow) {
   return Number((((row.price - row.prev_close) / row.prev_close) * 100).toFixed(2))
 }
 
-function getPosition(symbol) {
+function getPosition(symbol: string) {
   return positions.find((position) => position.symbol === symbol)
 }
 
-function toMarketRows() {
+function toMarketRows(): MarketRow[] {
   return market.map((row) => ({
     ...row,
     change_pct: changePct(row)
   }))
 }
 
-function toTreemapNodes() {
+function toTreemapNodes(): TreemapNode[] {
   return toMarketRows().map((row) => {
     const position = getPosition(row.symbol)
     const qty = position?.qty ?? 0
@@ -122,47 +117,11 @@ function toTreemapNodes() {
   })
 }
 
-function aggregateBars(symbol) {
-  const rows = ticks.filter((tick) => tick.symbol === symbol)
-  const buckets = new Map()
-
-  for (const tick of rows) {
-    const bucket = Math.floor(tick.ts / 60000) * 60000
-    const current = buckets.get(bucket)
-    if (!current) {
-      buckets.set(bucket, {
-        bucket: new Date(bucket).toISOString(),
-        symbol,
-        open: tick.price,
-        high: tick.price,
-        low: tick.price,
-        close: tick.price,
-        vol: tick.volume
-      })
-      continue
-    }
-
-    current.high = Math.max(current.high, tick.price)
-    current.low = Math.min(current.low, tick.price)
-    current.close = tick.price
-    current.vol += tick.volume
-  }
-
-  return [...buckets.values()].slice(-120)
-}
-
 function tickMarket() {
   market = market.map((row) => {
     const drift = (Math.random() - 0.48) * 0.004
     const nextPrice = roundPrice(row.price * (1 + drift))
     const volumeDelta = Math.floor(Math.random() * 20000)
-
-    ticks.push({
-      ts: Date.now(),
-      symbol: row.symbol,
-      price: nextPrice,
-      volume: volumeDelta
-    })
 
     return {
       ...row,
@@ -170,11 +129,9 @@ function tickMarket() {
       volume: row.volume + volumeDelta
     }
   })
-
-  if (ticks.length > 20000) ticks.splice(0, ticks.length - 20000)
 }
 
-function snapshot() {
+export function getDemoSnapshot(): SnapshotMessage {
   return {
     type: 'market.snapshot',
     generated_at: new Date().toISOString(),
@@ -183,42 +140,7 @@ function snapshot() {
   }
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', generated_at: new Date().toISOString() })
-})
-
-app.get('/market', (_req, res) => {
-  res.json({ generated_at: new Date().toISOString(), rows: toMarketRows() })
-})
-
-app.get('/positions', (_req, res) => {
-  res.json({ generated_at: new Date().toISOString(), positions })
-})
-
-app.get('/treemap', (_req, res) => {
-  res.json({ generated_at: new Date().toISOString(), nodes: toTreemapNodes() })
-})
-
-app.get('/bars/:symbol', (req, res) => {
-  res.json({ generated_at: new Date().toISOString(), bars: aggregateBars(req.params.symbol) })
-})
-
-const server = createServer(app)
-const wss = new WebSocketServer({ server })
-
-wss.on('connection', (socket) => {
-  socket.send(JSON.stringify(snapshot()))
-})
-
-setInterval(() => {
+export function advanceDemoSnapshot(): SnapshotMessage {
   tickMarket()
-  const message = JSON.stringify(snapshot())
-
-  for (const client of wss.clients) {
-    if (client.readyState === client.OPEN) client.send(message)
-  }
-}, 1000)
-
-server.listen(PORT, () => {
-  console.log(`API running on http://localhost:${PORT}`)
-})
+  return getDemoSnapshot()
+}
