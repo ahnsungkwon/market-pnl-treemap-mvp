@@ -1,8 +1,21 @@
+# Node
 node_modules
-.env
-.env.local
 dist
-.DS_Store
 npm-debug.log*
-pnpm-lock.yaml
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+apps/api/.env
+apps/api/.env.*
+!apps/api/.env.example
+
+# Build artifacts
+*.tsbuildinfo
+
+# system
+.DS_Store
 package-lock.json
+pnpm-lock.yaml

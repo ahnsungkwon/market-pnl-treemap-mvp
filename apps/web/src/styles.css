@@ -76,7 +76,7 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-width: 132px;
+  min-width: 180px;
   padding: 10px 14px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 999px;
@@ -86,11 +86,24 @@ h2 {
   font-weight: 700;
 }
 
-.connection span {
+.connection > span {
+  flex: 0 0 auto;
   width: 9px;
   height: 9px;
   border-radius: 999px;
   background: #f59e0b;
+}
+
+.connection p {
+  line-height: 1.2;
+}
+
+.connection small {
+  display: block;
+  margin-top: 3px;
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .connection-live span {
@@ -100,6 +113,11 @@ h2 {
 
 .connection-closed span {
   background: #ef4444;
+}
+
+.connection-polling > span {
+  background: #22c55e;
+  box-shadow: 0 0 16px rgba(34, 197, 94, 0.72);
 }
 
 .error-box {
@@ -303,7 +321,7 @@ td span {
   }
 }
 
-.connection-static span {
-  background: #38bdf8;
-  box-shadow: 0 0 16px rgba(56, 189, 248, 0.72);
+.connection-static > span {
+  background: #f59e0b;
+  box-shadow: 0 0 16px rgba(245, 158, 11, 0.72);
 }

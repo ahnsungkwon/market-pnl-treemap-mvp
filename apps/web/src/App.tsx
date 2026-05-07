@@ -1,6 +1,15 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ResponsiveContainer, Treemap } from 'recharts'
-import { fetchMarket, fetchTreemap, getWsUrl, isStaticMode, nextStaticSnapshot } from './api'
+import {
+  fetchHealth,
+  fetchMarket,
+  fetchRealtimeSnapshot,
+  fetchTreemap,
+  getRealtimePollUrl,
+  getWsUrl,
+  hasApiBaseUrl
+} from './api'
+import { advanceDemoSnapshot, getDemoSnapshot } from './demoData'
 import type { MarketRow, SnapshotMessage, TreemapNode } from './types'
 
 function formatNumber(value: number) {
@@ -21,6 +30,9 @@ function formatCompactKrw(value: number) {
     maximumFractionDigits: 1
   }).format(value)
 }
+
+type ConnectionState = 'connecting' | 'live' | 'polling' | 'static'
+type RealtimeMode = 'polling' | 'demo' | 'ws' | ''
 
 type TileProps = {
   x: number
@@ -65,71 +77,255 @@ function StatCard({ label, value, hint }: { label: string; value: string; hint?:
   )
 }
 
+function formatPollIntervalLabel(intervalMs: number) {
+  const intervalSec = Math.max(1, Math.round(intervalMs / 1000))
+  return `${intervalSec}s`
+}
+
+function connectionText(
+  connection: ConnectionState,
+  pollIntervalMs: number,
+  dataSource?: string,
+  realtimeMode?: RealtimeMode
+) {
+  const isDemo = dataSource === 'demo'
+
+  if (isDemo || connection === 'static') return 'Demo data · not live market price'
+  if (dataSource === 'kis' || dataSource === 'kiwoom') {
+    const providerLabel = dataSource === 'kiwoom' ? 'Kiwoom' : 'KIS'
+
+    if (realtimeMode === 'polling' || connection === 'polling') {
+      return `${providerLabel} live polling (${formatPollIntervalLabel(pollIntervalMs)})`
+    }
+
+    return `${providerLabel} live`
+  }
+  if (connection === 'polling') return `Live market data polling (${formatPollIntervalLabel(pollIntervalMs)})`
+  if (connection === 'live') return 'Live market data'
+  return 'Connecting'
+}
+
 export default function App() {
   const [market, setMarket] = useState<MarketRow[]>([])
   const [nodes, setNodes] = useState<TreemapNode[]>([])
   const [updatedAt, setUpdatedAt] = useState<string>('')
-  const [connection, setConnection] = useState<'connecting' | 'live' | 'closed' | 'static'>('connecting')
+  const [connection, setConnection] = useState<ConnectionState>('connecting')
   const [error, setError] = useState<string>('')
+  const [pollIntervalMs, setPollIntervalMs] = useState(15000)
+  const [realtimeMode, setRealtimeMode] = useState<RealtimeMode>('')
+
+  const wsRef = useRef<WebSocket | null>(null)
+  const pollTimerRef = useRef<number | null>(null)
+  const demoTimerRef = useRef<number | null>(null)
+  const wsFallbackTimerRef = useRef<number | null>(null)
+  const pollIntervalRef = useRef<number>(pollIntervalMs)
+
+  const [dataSource, setDataSource] = useState<string>('')
+
+  function syncPollInterval(nextPollIntervalMs: number) {
+    const clamped = Math.max(1000, Math.floor(nextPollIntervalMs))
+    pollIntervalRef.current = clamped
+    setPollIntervalMs(clamped)
+  }
+
+  function stopDemoMode() {
+    if (demoTimerRef.current !== null) {
+      window.clearInterval(demoTimerRef.current)
+      demoTimerRef.current = null
+    }
+  }
+
+  function stopPolling() {
+    if (pollTimerRef.current !== null) {
+      window.clearInterval(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+  }
+
+  function stopWebSocket() {
+    if (wsRef.current) {
+      wsRef.current.close()
+      wsRef.current = null
+    }
+
+    if (wsFallbackTimerRef.current !== null) {
+      window.clearTimeout(wsFallbackTimerRef.current)
+      wsFallbackTimerRef.current = null
+    }
+  }
+
+  function applySnapshot(message: SnapshotMessage) {
+    setMarket(message.rows)
+    setNodes(message.nodes)
+    setUpdatedAt(message.generated_at)
+
+    if (message.data_source) {
+      setDataSource(message.data_source)
+    }
+
+    if (message.realtime_mode) {
+      setRealtimeMode(message.realtime_mode)
+    }
+
+    setError('')
+  }
+
+  function startDemoFallback() {
+    setConnection('static')
+    setDataSource('demo')
+    setRealtimeMode('demo')
+    setError('API disconnected: Demo data · not live market price')
+    stopWebSocket()
+    stopPolling()
+
+    if (demoTimerRef.current !== null) {
+      return
+    }
+
+    const now = getDemoSnapshot()
+    setMarket(now.rows)
+    setNodes(now.nodes)
+    setUpdatedAt(now.generated_at)
+
+    demoTimerRef.current = window.setInterval(() => {
+      const snapshot = advanceDemoSnapshot()
+      applySnapshot(snapshot)
+    }, 1000)
+  }
+
+  function startPollingFallback(nextPollIntervalMs?: number) {
+    const pollUrl = getRealtimePollUrl()
+    if (!pollUrl) {
+      startDemoFallback()
+      return
+    }
+
+    const normalizedPollInterval = Math.max(1000, Math.floor(nextPollIntervalMs ?? pollIntervalRef.current))
+
+    setConnection('polling')
+    setRealtimeMode((prev) => (prev === 'demo' ? 'demo' : 'polling'))
+    setError((prev) =>
+      prev ||
+      `${dataSource === 'demo' ? 'Demo' : 'WebSocket'}가 연결되지 않아 ${dataSource === 'demo' ? 'demo' : '실시간'} polling(${formatPollIntervalLabel(normalizedPollInterval)})으로 전환합니다.`
+    )
+    stopDemoMode()
+
+    const tick = async () => {
+      try {
+        const snapshot = await fetchRealtimeSnapshot()
+        applySnapshot(snapshot)
+      } catch (pollError) {
+        setError(`폴링 오류: ${pollError instanceof Error ? pollError.message : 'unknown error'}`)
+      }
+    }
+
+    void tick()
+
+    if (pollTimerRef.current === null) {
+      pollTimerRef.current = window.setInterval(tick, normalizedPollInterval)
+    }
+
+    stopWebSocket()
+  }
+
+  function startRealtimeChannel() {
+    const wsUrl = getWsUrl()
+
+    if (!wsUrl) {
+      startPollingFallback()
+      return
+    }
+
+    stopPolling()
+
+    setConnection('connecting')
+
+    const socket = new WebSocket(wsUrl)
+    wsRef.current = socket
+
+    wsFallbackTimerRef.current = window.setTimeout(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        socket.close()
+        startPollingFallback()
+      }
+    }, 5000)
+
+    socket.onopen = () => {
+      if (wsFallbackTimerRef.current !== null) {
+        window.clearTimeout(wsFallbackTimerRef.current)
+        wsFallbackTimerRef.current = null
+      }
+
+      setConnection('live')
+      setError('')
+    }
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as SnapshotMessage
+        if (message.type !== 'market.snapshot') return
+        applySnapshot(message)
+      } catch {
+        setError('WS 메시지 파싱 실패: 데이터 형식이 올바르지 않습니다.')
+      }
+    }
+
+    socket.onerror = () => {
+      startPollingFallback()
+    }
+
+    socket.onclose = () => {
+      wsRef.current = null
+      if (hasApiBaseUrl()) {
+        startPollingFallback(pollIntervalRef.current)
+      }
+    }
+  }
 
   useEffect(() => {
-    let isMounted = true
+    let mounted = true
 
     async function loadInitialData() {
+      if (!hasApiBaseUrl()) {
+        startDemoFallback()
+        return
+      }
+
       try {
-        const [marketResponse, treemapResponse] = await Promise.all([fetchMarket(), fetchTreemap()])
-        if (!isMounted) return
+        const [marketResponse, treemapResponse, health] = await Promise.all([
+          fetchMarket(),
+          fetchTreemap(),
+          fetchHealth()
+        ])
+
+        if (!mounted) return
+
         setMarket(marketResponse.rows)
         setNodes(treemapResponse.nodes)
         setUpdatedAt(marketResponse.generated_at)
+
+        const nextSource = marketResponse.data_source || health.data_source
+        setDataSource(nextSource)
+        setRealtimeMode(health.realtime_mode ?? '')
+        syncPollInterval(health.poll_interval_ms ?? 15000)
+        setConnection('connecting')
+        setError('')
+
+        startRealtimeChannel()
       } catch (nextError) {
-        if (!isMounted) return
-        setError(nextError instanceof Error ? nextError.message : 'Unknown fetch error')
+        if (!mounted) return
+        startDemoFallback()
       }
     }
 
     loadInitialData()
 
     return () => {
-      isMounted = false
+      mounted = false
+      stopDemoMode()
+      stopPolling()
+      stopWebSocket()
     }
-  }, [])
-
-  useEffect(() => {
-    if (isStaticMode()) {
-      setConnection('static')
-      const timer = window.setInterval(() => {
-        const message = nextStaticSnapshot()
-        setMarket(message.rows)
-        setNodes(message.nodes)
-        setUpdatedAt(message.generated_at)
-        setError('')
-      }, 1000)
-
-      return () => window.clearInterval(timer)
-    }
-
-    const wsUrl = getWsUrl()
-    if (!wsUrl) {
-      setConnection('closed')
-      return
-    }
-
-    const socket = new WebSocket(wsUrl)
-
-    socket.onopen = () => setConnection('live')
-    socket.onclose = () => setConnection('closed')
-    socket.onerror = () => setConnection('closed')
-    socket.onmessage = (event) => {
-      const message = JSON.parse(event.data) as SnapshotMessage
-      if (message.type !== 'market.snapshot') return
-      setMarket(message.rows)
-      setNodes(message.nodes)
-      setUpdatedAt(message.generated_at)
-      setError('')
-    }
-
-    return () => socket.close()
   }, [])
 
   const sortedMarket = useMemo(
@@ -137,25 +333,13 @@ export default function App() {
     [market]
   )
 
-  const exposure = useMemo(
-    () => nodes.reduce((sum, node) => sum + node.price * node.qty, 0),
-    [nodes]
-  )
+  const exposure = useMemo(() => nodes.reduce((sum, node) => sum + node.price * node.qty, 0), [nodes])
 
-  const totalPnl = useMemo(
-    () => nodes.reduce((sum, node) => sum + node.pnl_amount, 0),
-    [nodes]
-  )
+  const totalPnl = useMemo(() => nodes.reduce((sum, node) => sum + node.pnl_amount, 0), [nodes])
 
-  const advancing = useMemo(
-    () => market.filter((row) => row.change_pct >= 0).length,
-    [market]
-  )
+  const advancing = useMemo(() => market.filter((row) => row.change_pct >= 0).length, [market])
 
-  const treemapData = useMemo(
-    () => nodes.map((node) => ({ ...node, name: node.label, size: node.value })),
-    [nodes]
-  )
+  const treemapData = useMemo(() => nodes.map((node) => ({ ...node, name: node.label, size: node.value })), [nodes])
 
   return (
     <main className="page-shell">
@@ -167,7 +351,13 @@ export default function App() {
         </div>
         <div className={`connection connection-${connection}`}>
           <span />
-          {connection === 'live' ? 'Live WS' : connection === 'static' ? 'Static demo' : connection === 'connecting' ? 'Connecting' : 'Disconnected'}
+          <div>
+            <p>{connectionText(connection, pollIntervalMs, dataSource, realtimeMode)}</p>
+            <small>
+              {dataSource ? `source: ${dataSource}` : 'source unknown'}
+              {realtimeMode ? ` · mode: ${realtimeMode}` : ''}
+            </small>
+          </div>
         </div>
       </header>
 
@@ -175,9 +365,21 @@ export default function App() {
 
       <section className="stats-grid">
         <StatCard label="Watchlist" value={`${market.length} symbols`} hint={`${advancing} advancing`} />
-        <StatCard label="Exposure" value={formatKrw(exposure)} hint="mock positions" />
+        <StatCard label="Exposure" value={formatKrw(exposure)} hint="positions overlay" />
         <StatCard label="Total P&L" value={formatKrw(totalPnl)} hint={totalPnl >= 0 ? 'positive' : 'negative'} />
-        <StatCard label="Updated" value={updatedAt ? new Date(updatedAt).toLocaleTimeString('ko-KR') : '-'} hint="WS tick" />
+        <StatCard
+          label="Updated"
+          value={updatedAt ? new Date(updatedAt).toLocaleTimeString('ko-KR') : '-'}
+          hint={
+            connection === 'polling'
+              ? `polling (${formatPollIntervalLabel(pollIntervalMs)})`
+              : connection === 'live'
+                ? 'WS'
+                : connection === 'static'
+                  ? 'demo mode'
+                  : 'loading'
+          }
+        />
       </section>
 
       <section className="dashboard-grid">
